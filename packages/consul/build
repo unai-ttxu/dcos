@@ -1,0 +1,10 @@
+#!/bin/bash -xe
+
+mkdir -p $PKG_PATH/bin
+cp -v /pkg/src/consul/consul $PKG_PATH/bin
+
+# Create the service file
+service="$PKG_PATH/dcos.target.wants_master/consul.service"
+mkdir -p "$(dirname "$service")"
+
+cp /pkg/extra/consul.service "$service"
