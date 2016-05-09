@@ -1,5 +1,7 @@
 #!/bin/bash -xe
+libdir="$PKG_PATH/lib"
 
+mkdir -p $libdir
 mkdir -p $PKG_PATH/bin
 cp -v /pkg/src/consul/consul $PKG_PATH/bin
 
