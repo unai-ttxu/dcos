@@ -16,7 +16,7 @@ from pkgpanda import Install, PackageId, Repository
 from pkgpanda.cli import add_to_repository
 from pkgpanda.constants import RESERVED_UNIT_NAMES
 from pkgpanda.exceptions import FetchError, PackageError, ValidationError
-from pkgpanda.util import (check_forbidden_services, download, load_json,
+from pkgpanda.util import (check_forbidden_services, download_atomic, load_json,
                            load_string, make_file, make_tar, rewrite_symlinks,
                            write_json, write_string)
 
@@ -49,6 +49,144 @@ class DockerCmd:
         docker.append(self.container)
         docker += cmd
         check_call(docker)
+
+
+def get_variants_from_filesystem(directory, extension):
+    results = set()
+    for filename in os.listdir(directory):
+        # Skip things that don't end in the extension
+        if not filename.endswith(extension):
+            continue
+
+        variant = filename[:-len(extension)]
+
+        # Empty name variant shouldn't have a `.` following it
+        if variant == '.':
+            raise BuildError("Invalid filename {}. The \"default\" variant file should be just {}".format(
+                filename, extension))
+
+        # Empty / default variant is represented as 'None'.
+        if variant == '':
+            variant = None
+        else:
+            # Should be foo. since we've moved the extension.
+            if variant[-1] != '.':
+                raise BuildError("Invalid variant filename {}. Expected a '.' separating the "
+                                 "variant name and extension '{}'.".format(filename, extension))
+            variant = variant[:-1]
+
+        results.add(variant)
+
+    return results
+
+
+class PackageStore:
+
+    def __init__(self, packages_dir, repository_url):
+        self._repository_url = repository_url.rstrip('/') if repository_url is not None else None
+        self._packages_dir = packages_dir.rstrip('/')
+
+        # Load all possible packages, making a dictionary from (name, variant) -> buildinfo
+        self._packages = dict()
+        self._packages_by_name = dict()
+
+        # Iterate through the packages directory finding all packages.
+        for name in os.listdir(self._packages_dir):
+            package_folder = self.get_package_folder(name)
+
+            # Ignore files / non-directories
+            if not os.path.isdir(package_folder):
+                continue
+
+            # Search the directory for buildinfo.json files, record the variants
+            self._packages_by_name[name] = dict()
+            for variant in get_variants_from_filesystem(package_folder, 'buildinfo.json'):
+                buildinfo = load_buildinfo(package_folder, variant)
+                self._packages[(name, variant)] = buildinfo
+                self._packages_by_name[name][variant] = buildinfo
+
+            # If there weren't any packages marked by buildinfo.json files, don't leave the index
+            # entry to simplify other code from having to check for empty dictionaries.
+            if len(self._packages_by_name[name]) == 0:
+                del self._packages_by_name[name]
+
+    def get_package_folder(self, name):
+        return self._packages_dir + '/' + name
+
+    def get_buildinfo(self, name, variant):
+        return self._packages[(name, variant)]
+
+    def get_last_bootstrap_set(self):
+        def get_last_bootstrap(variant):
+            bootstrap_latest = self._packages_dir + '/' + pkgpanda.util.variant_prefix(variant) + 'bootstrap.latest'
+            if not os.path.exists(bootstrap_latest):
+                raise BuildError("No last bootstrap found for variant {}. Expected to find {} to match "
+                                 "{}".format(pkgpanda.util.variant_name(variant), bootstrap_latest,
+                                             pkgpanda.util.variant_prefix(variant) + 'treeinfo.json'))
+            return load_string(bootstrap_latest)
+
+        result = {}
+        for variant in self.list_trees():
+            result[variant] = get_last_bootstrap(variant)
+        return result
+
+    def get_last_build_filename(self, name, variant):
+        return self.get_package_folder(name) + '/' + last_build_filename(variant)
+
+    def get_treeinfo(self, variant):
+        return load_config_variant(self._packages_dir, variant, 'treeinfo.json')
+
+    def list_trees(self):
+        return get_variants_from_filesystem(self._packages_dir, 'treeinfo.json')
+
+    @property
+    def packages(self):
+        return self._packages
+
+    @property
+    def packages_by_name(self):
+        return self._packages_by_name
+
+    @property
+    def packages_dir(self):
+        return self._packages_dir
+
+    def try_fetch_by_id(self, pkg_id):
+        assert isinstance(pkg_id, PackageId)
+        if self._repository_url is None:
+            return False
+
+        # TODO(cmaloney): Use storage providers to download instead of open coding.
+        pkg_path = "{}.tar.xz".format(pkg_id)
+        url = self._repository_url + '/packages/{0}/{1}'.format(pkg_id.name, pkg_path)
+        try:
+            directory = self.get_package_folder(pkg_id.name)
+            # TODO(cmaloney): Move to some sort of logging mechanism?
+            print("Attempting to download", pkg_id, "from", url, "to", directory)
+            download_atomic(directory + '/' + pkg_path, url, directory)
+            assert os.path.exists(directory + '/' + pkg_path)
+            return directory + '/' + pkg_path
+        except FetchError:
+            return False
+
+    def try_fetch_bootstrap_and_active(self, bootstrap_id):
+        if self._repository_url is None:
+            return False
+
+        try:
+            bootstrap_name = '{}.bootstrap.tar.xz'.format(bootstrap_id)
+            active_name = '{}.active.json'.format(bootstrap_id)
+            # TODO(cmaloney): Use storage providers to download instead of open coding.
+            bootstrap_url = self._repository_url + '/bootstrap/' + bootstrap_name
+            active_url = self._repository_url + '/bootstrap/' + active_name
+            print("Attempting to download", bootstrap_name, "from", bootstrap_url)
+            # Normalize to no trailing slash for repository_url
+            download_atomic(self._packages_dir + '/' + bootstrap_name, bootstrap_url, self._packages_dir)
+            print("Attempting to download", active_name, "from", active_url)
+            download_atomic(self._packages_dir + '/' + active_name, active_url, self._packages_dir)
+            return True
+        except FetchError:
+            return False
 
 
 def expand_require(require):
@@ -118,20 +256,6 @@ def hash_folder(directory):
             directory)]).decode('ascii').strip()
 
 
-def get_last_bootstrap_set(path):
-    assert path[-1] != '/'
-
-    def get_last_bootstrap(variant):
-        bootstrap_latest = path + '/' + pkgpanda.util.variant_prefix(variant) + 'bootstrap.latest'
-        if not os.path.exists(bootstrap_latest):
-            raise BuildError("No last bootstrap found for variant {}. Expected to find {} to match "
-                             "{}".format(pkgpanda.util.variant_name(variant), bootstrap_latest,
-                                         pkgpanda.util.variant_prefix(variant) + 'treeinfo.json'))
-        return load_string(bootstrap_latest)
-
-    return for_each_variant(path, get_last_bootstrap, 'treeinfo.json', {})
-
-
 def last_build_filename(variant):
     return "cache/" + ((variant + '.') if variant else "") + "latest"
 
@@ -158,34 +282,18 @@ def load_config_variant(directory, variant, extension):
 
 
 def load_buildinfo(path, variant):
-    return load_config_variant(path, variant, 'buildinfo.json')
+    buildinfo = load_config_variant(path, variant, 'buildinfo.json')
+
+    # Fill in default / guaranteed members so code everywhere doesn't have to guard around it.
+    buildinfo.setdefault('build_script', 'build')
+    buildinfo.setdefault('docker', 'dcos-builder:latest')
+    buildinfo.setdefault('environment', dict())
+    buildinfo.setdefault('requires', list())
+
+    return buildinfo
 
 
-def find_packages_fs(packages_dir):
-    # Treat the current directory as the base of a repository of packages.
-    # The packages are in folders, each containing a buildinfo.json, build.
-    # Load all the requires out of all the buildinfo.json variants and return
-    # them.
-    assert not packages_dir.endswith('/')
-
-    packages = dict()
-    for name in os.listdir(packages_dir):
-        package_folder = packages_dir + '/' + name
-        if os.path.isdir(package_folder):
-            def get_requires(variant):
-                buildinfo = load_buildinfo(package_folder, variant)
-                return {
-                    'requires': buildinfo.get('requires', list())
-                }
-            variant_requires = for_each_variant(package_folder, get_requires, "buildinfo.json", {})
-
-            for variant, requires in variant_requires.items():
-                packages[(name, variant)] = requires
-
-    return packages
-
-
-def make_bootstrap_tarball(packages_dir, packages, variant, repository_url):
+def make_bootstrap_tarball(package_store, packages, variant):
     # Convert filenames to package ids
     pkg_ids = list()
     for pkg_path in packages:
@@ -195,6 +303,8 @@ def make_bootstrap_tarball(packages_dir, packages, variant, repository_url):
             raise BuildError("Packages must be packaged / end with a .tar.xz. Got {}".format(filename))
         pkg_id = filename[:-len(".tar.xz")]
         pkg_ids.append(pkg_id)
+
+    packages_dir = package_store.packages_dir
 
     # Filename is output_name.<sha-1>.{active.json|.bootstrap.tar.xz}
     bootstrap_id = hash_checkout(pkg_ids)
@@ -213,44 +323,18 @@ def make_bootstrap_tarball(packages_dir, packages, variant, repository_url):
         print("bootstrap: {}".format(bootstrap_name))
         print("active: {}".format(active_name))
         print("latest: {}".format(latest_name))
-        return bootstrap_name
+        return bootstrap_id
 
     if (os.path.exists(bootstrap_name)):
         print("Bootstrap already up to date, not recreating")
         return mark_latest()
 
     # Try downloading.
-    if repository_url:
-        tmp_bootstrap = bootstrap_name + '.tmp'
-        tmp_active = active_name + '.tmp'
-        try:
-            repository_url = repository_url.rstrip('/')
-            bootstrap_url = repository_url + '/bootstrap/{}.bootstrap.tar.xz'.format(bootstrap_id)
-            active_url = repository_url + '/bootstrap/{}.active.json'.format(bootstrap_id)
-            print("Attempting to download", bootstrap_name, "from", bootstrap_url)
-            # Normalize to no trailing slash for repository_url
-            download(tmp_bootstrap, bootstrap_url, packages_dir)
-            print("Attempting to download", active_name, "from", active_url)
-            download(tmp_active, active_url, packages_dir)
+    if package_store.try_fetch_bootstrap_and_active(bootstrap_id):
+        print("Bootstrap already up to date, Not recreating. Downloaded from repository-url.")
+        return mark_latest()
 
-            # Move into place
-            os.rename(tmp_bootstrap, bootstrap_name)
-            os.rename(tmp_active, active_name)
-
-            print("Bootstrap already up to date, Not recreating. Downloaded from repository-url.")
-            return mark_latest()
-        except FetchError:
-            try:
-                os.remove(tmp_bootstrap)
-            except:
-                pass
-            try:
-                os.remove(tmp_active)
-            except:
-                pass
-
-            # Fall out and do the build since the command errored.
-            print("Unable to download from cache. Building.")
+    print("Unable to download from cache. Building.")
 
     print("Creating bootstrap tarball for variant {}".format(variant))
 
@@ -301,8 +385,8 @@ def make_bootstrap_tarball(packages_dir, packages, variant, repository_url):
 ALLOWED_TREEINFO_KEYS = {'exclude', 'variants', 'core_package_list'}
 
 
-def get_tree_package_tuples(packages_dir, tree_variant, possible_packages, package_requires):
-    treeinfo = load_config_variant(packages_dir, tree_variant, 'treeinfo.json')
+def get_tree_package_tuples(package_store, tree_variant):
+    treeinfo = package_store.get_treeinfo(tree_variant)
 
     if treeinfo.keys() > ALLOWED_TREEINFO_KEYS:
         raise BuildError(
@@ -350,7 +434,7 @@ def get_tree_package_tuples(packages_dir, tree_variant, possible_packages, packa
             raise BuildError("package {} is in excludes but was needed as a dependency of an "
                              "included package".format(name))
 
-        if name not in possible_packages or variant not in possible_packages[name]:
+        if (name, variant) not in package_store.packages:
             raise BuildError("package {} variant {} is needed but is not in the set of built "
                              "packages but is needed (explicitly requested or as a requires)".format(name, variant))
 
@@ -362,7 +446,7 @@ def get_tree_package_tuples(packages_dir, tree_variant, possible_packages, packa
         package_names.add(name)
         package_tuples.add((name, variant))
 
-    for name in possible_packages.keys():
+    for name in package_store.packages_by_name.keys():
         if core_package_list is not None:
             assert isinstance(core_package_list, list)
 
@@ -395,7 +479,7 @@ def get_tree_package_tuples(packages_dir, tree_variant, possible_packages, packa
     to_visit = list(package_tuples)
     while len(to_visit) > 0:
         name, variant = to_visit.pop()
-        requires = package_requires[(name, variant)]['requires']
+        requires = package_store.get_buildinfo(name, variant)['requires']
         for require in requires:
             require_tuple = expand_require(require)
             if require_tuple not in package_tuples:
@@ -419,15 +503,7 @@ def get_tree_package_tuples(packages_dir, tree_variant, possible_packages, packa
     return package_tuples
 
 
-def build_tree(packages_dir, mkbootstrap, repository_url, tree_variant):
-    packages = find_packages_fs(packages_dir)
-
-    # Turn packages into the possible_packages dictionary
-    possible_packages = dict()
-    for name, variant in packages.keys():
-        possible_packages.setdefault(name, set())
-        possible_packages[name].add(variant)
-
+def build_tree(package_store, mkbootstrap, tree_variant):
     # Check the requires and figure out a feasible build order
     # depth-first traverse the dependency tree, yielding when we reach a
     # leaf or all the dependencies of package have been built. If we get
@@ -451,26 +527,24 @@ def build_tree(packages_dir, mkbootstrap, repository_url, tree_variant):
         assert pkg_tuple not in visited
         visited.add(pkg_tuple)
 
-        name = pkg_tuple[0]
-
-        # Ensure all dependencies are built
-        for require in sorted(packages[pkg_tuple].get("requires", list())):
+        # Ensure all dependencies are built. Sorted for stability
+        for require in sorted(package_store.packages[pkg_tuple]['requires']):
             require_tuple = expand_require(require)
             if require_tuple in built:
                 continue
             if require_tuple in visited:
-                raise BuildError("Circular dependency. Circular link {0} -> {1}".format(name, require_tuple))
+                raise BuildError("Circular dependency. Circular link {0} -> {1}".format(pkg_tuple, require_tuple))
 
             if PackageId.is_id(require_tuple[0]):
                 raise BuildError("Depending on a specific package id is not supported. Package {} "
-                                 "depends on {}".format(name, require_tuple))
+                                 "depends on {}".format(pkg_tuple, require_tuple))
 
-            if require_tuple not in packages:
-                raise BuildError("Package {0} require {1} not buildable from tree.".format(name, require_tuple))
+            if require_tuple not in package_store.packages:
+                raise BuildError("Package {0} require {1} not buildable from tree.".format(pkg_tuple, require_tuple))
 
             visit(require_tuple)
 
-        build_order.append(name)
+        build_order.append(pkg_tuple)
         built.add(pkg_tuple)
 
     # Can't compare none to string, so expand none -> "true" / "false", then put
@@ -478,48 +552,54 @@ def build_tree(packages_dir, mkbootstrap, repository_url, tree_variant):
     def key_func(elem):
         return elem[0], elem[1] is None, elem[1] or ""
 
-    # Build everything if no variant is given
-    if tree_variant is None:
-        # Since there may be multiple isolated dependency trees, iterate through
-        # all packages to find them all.
-        for pkg_tuple in sorted(packages.keys(), key=key_func):
-            if pkg_tuple in visited:
-                continue
-            visit(pkg_tuple)
-    else:
-        # Build all the things needed for this variant and only this variant
-        all_tuples = get_tree_package_tuples(packages_dir, tree_variant, possible_packages, packages)
+    def visit_packages_in_tree(variant):
+        all_tuples = get_tree_package_tuples(package_store, variant)
         for pkg_tuple in sorted(all_tuples, key=key_func):
             if pkg_tuple in visited:
                 continue
             visit(pkg_tuple)
 
+    if tree_variant is None:
+        tree_visit_list = list(sorted(package_store.list_trees(), key=pkgpanda.util.variant_str))
+    else:
+        tree_visit_list = [tree_variant]
+
+    for tree in tree_visit_list:
+        visit_packages_in_tree(tree)
+
     built_packages = dict()
-    for name in build_order:
-        print("Building: {}".format(name))
+    for (name, variant) in build_order:
+        print("Building: {} variant {}".format(name, pkgpanda.util.variant_str(variant)))
+        built_packages.setdefault(name, dict())
 
         # Run the build, store the built package path for later use.
         # TODO(cmaloney): Only build the requested variants, rather than all variants.
-        built_packages[name] = build_package_variants(packages_dir + '/' + name, name, repository_url)
+        built_packages[name][variant] = build(
+            package_store,
+            name,
+            variant,
+            True)
 
     def make_bootstrap(variant):
         print("Making bootstrap variant:", variant or "<default>")
         package_paths = list()
-        for name, pkg_variant in get_tree_package_tuples(packages_dir, variant, possible_packages, packages):
+        for name, pkg_variant in get_tree_package_tuples(package_store, variant):
             package_paths.append(built_packages[name][pkg_variant])
 
         if mkbootstrap:
-            return make_bootstrap_tarball(packages_dir, list(sorted(package_paths)), variant, repository_url)
+            return make_bootstrap_tarball(
+                package_store,
+                list(sorted(package_paths)),
+                variant)
 
     # Make sure all treeinfos are satisfied and generate their bootstrap
     # tarballs if requested.
     # TODO(cmaloney): Allow distinguishing between "build all" and "build the default one".
-    if tree_variant is None:
-        return for_each_variant(packages_dir, make_bootstrap, "treeinfo.json", {})
-    else:
-        return {
-            tree_variant: make_bootstrap(tree_variant)
-        }
+    results = {}
+    for variant in tree_visit_list:
+        results[variant] = make_bootstrap(variant)
+
+    return results
 
 
 def expand_single_source_alias(pkg_name, buildinfo):
@@ -538,52 +618,26 @@ def assert_no_duplicate_keys(lhs, rhs):
         assert len(lhs.keys() & rhs.keys()) == 0
 
 
-def for_each_variant(variant_dir, fn, extension, extra_kwargs):
-    # Find all the files which end in the extension. Remove the extension to get just the variant. Include
-    # the None / default variant always
+# Find all build variants and build them
+def build_package_variants(package_store, name, clean_after_build=True):
+    # Find the packages dir / root of the packages tree, and create a PackageStore
     results = dict()
-    for filename in os.listdir(variant_dir):
-        if not filename.endswith(extension):
-            continue
-
-        variant = filename[:-len(extension)]
-
-        # Empty name variant shouldn't have a `.` following it
-        if variant == '.':
-            raise BuildError("Invalid filename {}. The \"default\" variant file should be just {}".format(
-                filename, extension))
-
-        # Empty / default variant is represented as 'None'.
-        if variant == '':
-            variant = None
-        else:
-            # Should be foo. since we've moved the extension.
-            if variant[-1] != '.':
-                raise BuildError("Invalid variant filename {}. Expected a '.' separating the "
-                                 "variant name and extension.".format(filename))
-            variant = variant[:-1]
-        results[variant] = fn(variant=variant, **extra_kwargs)
-
+    for variant in package_store.packages_by_name[name].keys():
+        results[variant] = build(
+            package_store,
+            name,
+            variant,
+            clean_after_build=clean_after_build)
     return results
 
 
-# Find all build variants and build them
-def build_package_variants(package_dir, name, repository_url, clean_after_build=True):
-    return for_each_variant(
-        package_dir,
-        build,
-        "buildinfo.json",
-        {
-            "package_dir": package_dir,
-            "name": name,
-            "repository_url": repository_url,
-            "clean_after_build": clean_after_build})
-
-
-def build(variant, package_dir, name, repository_url, clean_after_build):
-    print("Building package {} variant {}".format(name, variant or "<default>"))
+def build(package_store, name, variant, clean_after_build):
+    assert isinstance(package_store, PackageStore)
+    print("Building package {} variant {}".format(name, pkgpanda.util.variant_str(variant)))
     tmpdir = tempfile.TemporaryDirectory(prefix="pkgpanda_repo")
     repository = Repository(tmpdir.name)
+
+    package_dir = package_store.get_package_folder(name)
 
     def pkg_abs(name):
         return package_dir + '/' + name
@@ -594,15 +648,13 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
     # Build up the docker command arguments over time, translating fields as needed.
     cmd = DockerCmd()
 
-    buildinfo = load_buildinfo(package_dir, variant)
+    assert (name, variant) in package_store.packages, \
+        "Programming error: name, variant should have been validated to be valid before calling build()."
+    buildinfo = copy.deepcopy(package_store.get_buildinfo(name, variant))
 
     if 'name' in buildinfo:
         raise BuildError("'name' is not allowed in buildinfo.json, it is implicitly the name of the "
                          "folder containing the buildinfo.json")
-
-    # Make sure build_script is only set on variants
-    if 'build_script' in buildinfo and variant is None:
-        raise BuildError("build_script can only be set on package variants")
 
     # Convert single_source -> sources
     try:
@@ -646,7 +698,7 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
 
     # Add the sha1sum of the buildinfo.json + build file to the build ids
     build_ids = {"sources": checkout_ids}
-    build_ids['build'] = pkgpanda.util.sha1(pkg_abs("build"))
+    build_ids['build'] = pkgpanda.util.sha1(pkg_abs(buildinfo['build_script']))
     build_ids['pkgpanda_version'] = pkgpanda.build.constants.version
     build_ids['variant'] = '' if variant is None else variant
 
@@ -659,7 +711,7 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
         buildinfo['extra_source'] = extra_id
 
     # Figure out the docker name.
-    docker_name = buildinfo.get('docker', 'dcos-builder:latest')
+    docker_name = buildinfo['docker']
     cmd.container = docker_name
 
     # Add the id of the docker build environment to the build_ids.
@@ -674,7 +726,7 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
 
     # TODO(cmaloney): The environment variables should be generated during build
     # not live in buildinfo.json.
-    build_ids['environment'] = buildinfo.get('environment', {})
+    build_ids['environment'] = buildinfo['environment']
 
     # Packages need directories inside the fake install root (otherwise docker
     # will try making the directories on a readonly filesystem), so build the
@@ -722,20 +774,19 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
 
             # Figure out the last build of the dependency, add that as the
             # fully expanded dependency.
-            require_package_dir = os.path.normpath(pkg_abs('../' + requires_name))
-            last_build = require_package_dir + '/' + last_build_filename(requires_variant)
-            if not os.path.exists(last_build):
+            requires_last_build = package_store.get_last_build_filename(requires_name, requires_variant)
+            if not os.path.exists(requires_last_build):
                 raise BuildError("No last build file found for dependency {} variant {}. Rebuild "
                                  "the dependency".format(requires_name, requires_variant))
 
             try:
-                pkg_id_str = load_string(last_build)
+                pkg_id_str = load_string(requires_last_build)
                 auto_deps.add(pkg_id_str)
-                pkg_buildinfo = load_buildinfo(require_package_dir, requires_variant)
-                pkg_requires = pkg_buildinfo.get('requires', list())
+                pkg_buildinfo = package_store.get_buildinfo(requires_name, requires_variant)
+                pkg_requires = pkg_buildinfo['requires']
                 pkg_path = repository.package_path(pkg_id_str)
                 pkg_tar = pkg_id_str + '.tar.xz'
-                if not os.path.exists(require_package_dir + '/' + pkg_tar):
+                if not os.path.exists(package_store.get_package_folder(requires_name) + '/' + pkg_tar):
                     raise BuildError("The build tarball {} refered to by the last_build file of the "
                                      "dependency {} variant {} doesn't exist. Rebuild the dependency.".format(
                                         pkg_tar,
@@ -796,30 +847,19 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
         return pkg_path
 
     # Try downloading.
-    if repository_url:
-        tmp_filename = pkg_path + '.tmp'
-        try:
-            # Normalize to no trailing slash for repository_url
-            repository_url = repository_url.rstrip('/')
-            url = repository_url + '/packages/{0}/{1}.tar.xz'.format(pkg_id.name, str(pkg_id))
-            print("Attempting to download", pkg_id, "from", url)
-            download(tmp_filename, url, package_dir)
-            os.rename(tmp_filename, pkg_path)
+    dl_path = package_store.try_fetch_by_id(pkg_id)
+    if dl_path:
+        print("Package up to date. Not re-building. Downloaded from repository-url.")
+        # TODO(cmaloney): Updating / filling last_build should be moved out of
+        # the build function.
+        check_call(["mkdir", "-p", pkg_abs("cache")])
+        write_string(pkg_abs(last_build_filename(variant)), str(pkg_id))
+        print(dl_path, pkg_path)
+        assert dl_path == pkg_path
+        return pkg_path
 
-            print("Package up to date. Not re-building. Downloaded from repository-url.")
-            # TODO(cmaloney): Updating / filling last_build should be moved out of
-            # the build function.
-            check_call(["mkdir", "-p", pkg_abs("cache")])
-            write_string(pkg_abs(last_build_filename(variant)), str(pkg_id))
-            return pkg_path
-        except FetchError:
-            try:
-                os.remove(tmp_filename)
-            except:
-                pass
-
-            # Fall out and do the build since the command errored.
-            print("Unable to download from cache. Proceeding to build")
+    # Fall out and do the build since it couldn't be downloaded
+    print("Unable to download from cache. Proceeding to build")
 
     print("Building package {} with buildinfo: {}".format(
         pkg_id,
@@ -861,8 +901,7 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
         raise BuildError("Validation error when fetching sources for package: {}".format(ex))
 
     # Copy over environment settings
-    if 'environment' in buildinfo:
-        pkginfo['environment'] = buildinfo['environment']
+    pkginfo['environment'] = buildinfo['environment']
 
     # Activate the packages so that we have a proper path, environment
     # variables.
@@ -900,7 +939,7 @@ def build(variant, package_dir, name, repository_url, clean_after_build):
         # TODO(cmaloney): src should be read only...
         pkg_abs("src"): "/pkg/src:rw",
         # The build script
-        pkg_abs(buildinfo.get('build_script', 'build')): "/pkg/build:ro",
+        pkg_abs(buildinfo['build_script']): "/pkg/build:ro",
         # Getting the result out
         pkg_abs("result"): "/opt/mesosphere/packages/{}:rw".format(pkg_id),
         install_dir: "/opt/mesosphere:ro"
